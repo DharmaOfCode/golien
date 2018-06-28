@@ -1,2 +1,2 @@
 # golien
-A tool to quickly update asset data in AlienVault USM anywhere
+A tool for quick asset updates (in bulk) in AlienVault USM anywhere

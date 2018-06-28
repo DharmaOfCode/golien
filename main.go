@@ -13,18 +13,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"github.com/DharmaOfCode/tenago/util"
+	"sort"
 )
 
-const baseURL string = "[USM URL HERE]"
+const baseURL string = "https://[HOSTNAME].alienvault.cloud/"
 
 var searchAssetsBody = []byte(`{"define":{"a":{"type":"Asset"},"g":{"type":"AssetGroup","join":"a","relationship":"AssetMemberOfAssetGroup","fromLeft":true},"s":{"type":"Service","join":"a","relationship":"AssetHasService","fromLeft":true},"c":{"type":"CPEItem","join":"a","relationship":"AssetHasCPEItem","fromLeft":true},"p":{"type":"Plugin","join":"a","relationship":"AssetHasPlugin","fromLeft":true}},"where":[{"and":{"==":{"a.knownAsset":"true"}}}],"return":{"assets":{"object":"a","page":{"start":0,"count":250},"inject":{"AssetHasNetworkInterface":{"relationship":"AssetHasNetworkInterface","fromLeft":true,"inject":{"NetworkInterfaceHasHostname":{"relationship":"NetworkInterfaceHasHostname","fromLeft":true}}},"AssetHasCredentials":{"relationship":"AssetHasCredentials","fromLeft":true},"AssetHasAgent":{"relationship":"AssetHasAgent","fromLeft":true}},"sort":["a.dateUpdated desc"]},"agg_operatingSystem":{"aggregation":"a.operatingSystem","sort":["count desc","value asc"],"count":50},"agg_deviceType":{"aggregation":"a.deviceType","sort":["count desc","value asc"],"count":50},"agg_assetOriginType":{"aggregation":"a.assetOriginType","sort":["count desc","value asc"],"count":50},"agg_AssetMemberOfAssetGroup":{"aggregation":"g.id","sort":["count desc","value asc"]},"agg_assetService":{"aggregation":"s.data","sort":["count desc","value asc"],"count":50},"agg_assetSoftware":{"aggregation":"c.name","sort":["count desc","value asc"],"count":50},"agg_assetPlugin":{"aggregation":"p.name","sort":["count desc","value asc"],"count":50},"agg_assetOriginUUID":{"aggregation":"a.assetOriginUUID","sort":["count desc","value asc"],"count":50}}}`)
-
-type State struct {
-	Client      *Client
-	UpdateAssets bool
-	Verbose      bool
-	Domain		 string
-}
 
 type AssetResult struct {
 	Json  []byte
@@ -51,6 +46,8 @@ type Client struct {
 type Asset struct {
 	Id                     string                  `json:"id"`
 	Name                   string                  `json:"name"`
+	EventCount			   json.Number				`json:"eventCount"`
+	AlarmCount			   json.Number				`json:"alarmCount"`
 	AssetNetworkInterfaces []AssetNetworkInterface `json:"AssetHasNetworkInterface"`
 }
 
@@ -61,6 +58,16 @@ type Assets struct {
 
 type QueryResult struct {
 	Assets Assets `json:"assets"`
+}
+
+type State struct {
+	Client      *Client
+	UpdateAssets bool
+	Verbose      bool
+	Domain		 string
+	Query		 bool
+	LessThan	 int
+	GreaterThan  int
 }
 
 func ParseCmdLine() *State {
@@ -75,8 +82,11 @@ func ParseCmdLine() *State {
 	flag.StringVar(&c.Cookie, "c", "", "Cookies to use for the request")
 	flag.StringVar(&c.UserAgent, "u", "", "User Agent string")
 	flag.StringVar(&c.XSRFToken, "x", "", "XSRF Token")
-	flag.StringVar(&s.Domain, "d", "", "Base domain to be used in FQDN (i.e. -d mycompany.com")
 
+	flag.IntVar(&s.LessThan, "l", -1, "Less than value for events")
+	flag.IntVar(&s.GreaterThan, "g", -1, "Greater than value for events")
+	flag.BoolVar(&s.Query, "q", false, "Query assets")
+	flag.StringVar(&s.Domain, "d", "", "Base domain to be used in FQDN (i.e. -d mycompany.com")
 	flag.BoolVar(&s.Verbose, "v", false, "Verbose output")
 
 	cookieJar, _ := cookiejar.New(nil)
@@ -200,7 +210,51 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 	return body, err
 }
 
-func Process(s *State) {
+func QueryAssets(s *State){
+	r, err := s.Client.ListAssets()
+	if err != nil {
+		fmt.Println(err)
+	}
+	var assetsList []Asset
+	if s.LessThan >= 0 {
+		for _, asset := range r.Assets.Assets{
+			eventCount, err := asset.EventCount.Int64()
+			if err != nil{
+				fmt.Println(err)
+				panic(err)
+			}
+			if eventCount < int64(s.LessThan) && eventCount > int64(s.GreaterThan){
+				assetsList = append(assetsList, asset)
+			}
+		}
+	} else {
+		assetsList = r.Assets.Assets
+	}
+
+	columns := []string{"Asset ID", "Asset Name", "Event Count"}
+	resultTable := util.ResultTable{
+		Columns: columns,
+	}
+
+	for _, v := range assetsList {
+		row := []string{v.Id, v.Name, string(v.EventCount)}
+		resultTable.Rows = append(resultTable.Rows, row)
+	}
+
+	// Sort it
+	sort.Slice(resultTable.Rows, func(i, j int) bool {
+		val1 := resultTable.Rows[i][2]
+		val2 := resultTable.Rows[j][2]
+		return val1 < val2
+	})
+	util.PrintResult(true, &resultTable)
+}
+
+func OrderAssetsBy(){
+
+}
+
+func UpdateAssets(s *State){
 	fmt.Print("\n\n==========================================\n")
 	r, err := s.Client.ListAssets()
 	if err != nil {
@@ -225,28 +279,38 @@ func Process(s *State) {
 		}
 	}
 
-	if s.UpdateAssets{
-		uch := make(chan *Asset)
-		fmt.Println("Assets without FQDN:")
-		fmt.Println("==========================================")
-		for _, _ = range orphaned {
-			assetDetails := <-ch
-			idx := strings.Index(string(assetDetails.Json), "NetworkInterfaceHasHostname\":[{\"name\":\"\",")
-			if idx != -1 {
-				fmt.Println("Asset is missing FQDN ------>  " + assetDetails.Asset.Name + " ")
-				changed := strings.Replace(string(assetDetails.Json), "\"NetworkInterfaceHasHostname\":[{\"name\":\"\"", "\"NetworkInterfaceHasHostname\":[{\"name\":\""+assetDetails.Asset.Name+"." + s.Domain + "\"", -1)
-				go s.Client.UpdateAssetDetailsWithChannel(assetDetails.Asset, []byte(changed), uch)
-			}
+	uch := make(chan *Asset)
+	fmt.Println("Assets without FQDN:")
+	fmt.Println("==========================================")
+	for _, _ = range orphaned {
+		assetDetails := <-ch
+		idx := strings.Index(string(assetDetails.Json), "NetworkInterfaceHasHostname\":[{\"name\":\"\",")
+		if idx != -1 {
+			fmt.Println("Asset is missing FQDN ------>  " + assetDetails.Asset.Name + " ")
+			changed := strings.Replace(string(assetDetails.Json), "\"NetworkInterfaceHasHostname\":[{\"name\":\"\"", "\"NetworkInterfaceHasHostname\":[{\"name\":\""+assetDetails.Asset.Name+"." + s.Domain + "\"", -1)
+			go s.Client.UpdateAssetDetailsWithChannel(assetDetails.Asset, []byte(changed), uch)
 		}
+	}
 
-		fmt.Printf("\n TOTAL ASSETS WITHOUT FQDN = %d\n", len(orphaned))
-		fmt.Println("==========================================")
-		fmt.Printf("\nUpdated assets with missing FQDN:\n")
-		fmt.Println("==========================================")
-		for _, _ = range orphaned {
-			updatedAsset := <-uch
-			fmt.Println("Succesfully updated " + updatedAsset.Name)
-		}
+	fmt.Printf("\n TOTAL ASSETS WITHOUT FQDN = %d\n", len(orphaned))
+	fmt.Println("==========================================")
+	fmt.Printf("\nUpdated assets with missing FQDN:\n")
+	fmt.Println("==========================================")
+	for _, _ = range orphaned {
+		updatedAsset := <-uch
+		fmt.Println("Succesfully updated " + updatedAsset.Name)
+	}
+}
+
+func Process(s *State) {
+	fmt.Print("\n\n==========================================\n")
+
+	if s.Query{
+		QueryAssets(s)
+	}
+
+	if s.UpdateAssets{
+		UpdateAssets(s)
 	}
 
 	os.Exit(0)
